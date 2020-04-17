@@ -48,6 +48,7 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <sys/resource.h>
+#include <arpa/inet.h>
 #endif
 #include <fcntl.h>
 #include <stdlib.h>
@@ -64,6 +65,7 @@
 
 #include <event.h>
 #include <evutil.h>
+#include <event2/listener.h>
 
 static ev_ssize_t count, fired;
 static int writes, failures;
@@ -71,6 +73,7 @@ static evutil_socket_t *pipes;
 static int num_pipes, num_active, num_writes;
 static struct event *events;
 static struct event_base *base;
+static unsigned short server_port = 4444;
 
 
 static void
@@ -88,7 +91,7 @@ read_cb(evutil_socket_t fd, short which, void *arg)
 	if (writes) {
 		if (widx >= num_pipes)
 			widx -= num_pipes;
-		n = send(pipes[2 * widx + 1], "e", 1, 0);
+		n = send(pipes[widx], "e", 1, 0);
 		if (n != 1)
 			failures++;
 		writes--;
@@ -99,14 +102,13 @@ read_cb(evutil_socket_t fd, short which, void *arg)
 static struct timeval *
 run_once(void)
 {
-	evutil_socket_t *cp, space;
-	long i;
+	long i, space;
 	static struct timeval ts, te;
 
-	for (cp = pipes, i = 0; i < num_pipes; i++, cp += 2) {
+	for (i = 0; i < num_pipes; i++) {
 		if (event_initialized(&events[i]))
 			event_del(&events[i]);
-		event_assign(&events[i], base, cp[0], EV_READ | EV_PERSIST, read_cb, (void *)(ev_intptr_t) i);
+		event_assign(&events[i], base, pipes[i], EV_READ | EV_PERSIST, read_cb, (void *)(ev_intptr_t) i);
 		event_add(&events[i], NULL);
 	}
 
@@ -114,9 +116,8 @@ run_once(void)
 
 	fired = 0;
 	space = num_pipes / num_active;
-	space = space * 2;
 	for (i = 0; i < num_active; i++, fired++)
-		(void) send(pipes[i * space + 1], "e", 1, 0);
+		(void) send(pipes[i * space], "e", 1, 0);
 
 	count = 0;
 	writes = num_writes;
@@ -139,6 +140,111 @@ run_once(void)
 	return (&te);
 }
 
+static int
+create_conn(evutil_socket_t *cp, struct sockaddr_in *sin)
+{
+	*cp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (connect(*cp, (struct sockaddr*)sin, sizeof(*sin))) {
+		int err = EVUTIL_SOCKET_ERROR();
+		fprintf(stderr, "connect: %d (%s)\n",
+			err, evutil_socket_error_to_string(err));
+		return -1;
+	}
+	return 0;
+}
+
+static void
+client_run(struct sockaddr_in *sin)
+{
+	int i;
+	struct timeval *tv;
+
+	events = calloc(num_pipes, sizeof(struct event));
+	pipes = calloc(num_pipes, sizeof(evutil_socket_t));
+	if (events == NULL || pipes == NULL) {
+		perror("calloc");
+		exit(1);
+	}
+
+	for (i = 0; i < num_pipes; i++) {
+		if (create_conn(&pipes[i], sin) == -1) {
+			perror("pipe");
+			exit(1);
+		}
+	}
+
+	for (i = 0; i < 25; i++) {
+		tv = run_once();
+		fprintf(stdout, "%ld\n", tv->tv_sec * 1000000L + tv->tv_usec);
+	}
+}
+
+static void
+server_read_cb(evutil_socket_t fd, short which, void *arg)
+{
+	unsigned char ch;
+	ev_ssize_t n;
+
+	n = recv(fd, (char*)&ch, sizeof(ch), 0);
+	if (n == 0) {
+		event_del((struct event*)arg);
+		evutil_closesocket(fd);
+	}
+	else if (n < 0) {
+		perror("recv");
+		event_del((struct event*)arg);
+		evutil_closesocket(fd);
+	}
+	else
+		n = send(fd, "e", 1, 0);
+}
+
+static void
+accept_conn_cb(struct evconnlistener *listener, evutil_socket_t fd,
+	struct sockaddr *address, int socklen, void *ctx)
+{
+	evutil_make_socket_nonblocking(fd);
+
+	event_add(
+		event_new(base, fd, EV_READ | EV_PERSIST, server_read_cb,
+			event_self_cbarg()), NULL);
+}
+
+static void
+accept_error_cb(struct evconnlistener *listener, void *arg)
+{
+	int err = EVUTIL_SOCKET_ERROR();
+	fprintf(stderr, "accept_error_cb %d (%s) Shutting down.\n",
+		err, evutil_socket_error_to_string(err));
+
+	event_base_loopexit(base, NULL);
+}
+
+static void
+server_run(void)
+{
+	struct evconnlistener *l;
+	struct sockaddr_in sin;
+
+	base = event_base_new();
+
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(0);
+	sin.sin_port = htons(server_port);
+
+	l = evconnlistener_new_bind(
+		base, accept_conn_cb, NULL, LEV_OPT_CLOSE_ON_FREE|LEV_OPT_REUSEABLE, -1,
+		(struct sockaddr*)&sin, sizeof(sin));
+	if (!l) {
+		perror("evconnlistener_new_bind");
+		return;
+	}
+	evconnlistener_set_error_cb(l, accept_error_cb);
+
+	event_base_dispatch(base);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -146,11 +252,11 @@ main(int argc, char **argv)
 	struct rlimit rl;
 #endif
 	int i, c;
-	struct timeval *tv;
-	evutil_socket_t *cp;
 	const char **methods;
 	const char *method = NULL;
 	struct event_config *cfg = NULL;
+	int server = 0;
+	struct sockaddr_in sin;
 
 #ifdef _WIN32
 	WSADATA WSAData;
@@ -159,7 +265,10 @@ main(int argc, char **argv)
 	num_pipes = 100;
 	num_active = 1;
 	num_writes = num_pipes;
-	while ((c = getopt(argc, argv, "n:a:w:m:l")) != -1) {
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons(server_port);
+	while ((c = getopt(argc, argv, "n:a:w:m:c:ls")) != -1) {
 		switch (c) {
 		case 'n':
 			num_pipes = atoi(optarg);
@@ -172,6 +281,12 @@ main(int argc, char **argv)
 			break;
 		case 'm':
 			method = optarg;
+			break;
+		case 's':
+			server = 1;
+			break;
+		case 'c':
+			inet_pton(AF_INET, optarg, &sin.sin_addr);
 			break;
 		case 'l':
 			methods = event_get_supported_methods();
@@ -187,19 +302,12 @@ main(int argc, char **argv)
 	}
 
 #ifdef EVENT__HAVE_SETRLIMIT
-	rl.rlim_cur = rl.rlim_max = num_pipes * 2 + 50;
+	rl.rlim_cur = rl.rlim_max = 65536;
 	if (setrlimit(RLIMIT_NOFILE, &rl) == -1) {
 		perror("setrlimit");
 		exit(1);
 	}
 #endif
-
-	events = calloc(num_pipes, sizeof(struct event));
-	pipes = calloc(num_pipes * 2, sizeof(evutil_socket_t));
-	if (events == NULL || pipes == NULL) {
-		perror("malloc");
-		exit(1);
-	}
 
 	if (method != NULL) {
 		cfg = event_config_new();
@@ -212,24 +320,10 @@ main(int argc, char **argv)
 	} else
 		base = event_base_new();
 
-	for (cp = pipes, i = 0; i < num_pipes; i++, cp += 2) {
-#ifdef USE_PIPES
-		if (pipe(cp) == -1) {
-#else
-		if (evutil_socketpair(AF_UNIX, SOCK_STREAM, 0, cp) == -1) {
-#endif
-			perror("pipe");
-			exit(1);
-		}
-	}
-
-	for (i = 0; i < 25; i++) {
-		tv = run_once();
-		if (tv == NULL)
-			exit(1);
-		fprintf(stdout, "%ld\n",
-			tv->tv_sec * 1000000L + tv->tv_usec);
-	}
+	if (server)
+		server_run();
+	else
+		client_run(&sin);
 
 	exit(0);
 }
