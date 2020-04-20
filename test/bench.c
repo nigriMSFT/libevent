@@ -216,7 +216,7 @@ main(int argc, char **argv)
 #ifdef USE_PIPES
 		if (pipe(cp) == -1) {
 #else
-		if (evutil_socketpair(AF_UNIX, SOCK_STREAM, 0, cp) == -1) {
+		if (evutil_ersatz_socketpair_(AF_INET, SOCK_STREAM, 0, cp) == -1) {
 #endif
 			perror("pipe");
 			exit(1);
